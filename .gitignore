@@ -1,0 +1,4 @@
+node_modules
+trades.db
+package-lock.json
+.DS_Store
