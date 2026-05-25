@@ -717,12 +717,24 @@
 <script>
 let trades = [];
 const API_URL = '/api';
-const GOOGLE_CLIENT_ID = 'YOUR_GOOGLE_CLIENT_ID.apps.googleusercontent.com';
+let GOOGLE_CLIENT_ID = 'YOUR_GOOGLE_CLIENT_ID.apps.googleusercontent.com';
 let currentUser = null;
 
 // Check user login session on load
-function checkAuth() {
+async function checkAuth() {
   const savedUser = localStorage.getItem('user');
+
+  // Try to load dynamic config from backend
+  try {
+    const configRes = await fetch(`${API_URL}/config`);
+    const configData = await configRes.json();
+    if (configData.success && configData.googleClientId) {
+      GOOGLE_CLIENT_ID = configData.googleClientId;
+    }
+  } catch (err) {
+    console.warn('Failed to load configuration from backend, falling back to default Client ID.', err);
+  }
+
   if (savedUser) {
     currentUser = JSON.parse(savedUser);
     updateAuthUI();

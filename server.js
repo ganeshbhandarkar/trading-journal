@@ -202,6 +202,11 @@ const getAuthUser = (req, res, next) => {
 
 // ── Authentication Route ────────────────────────────────────
 
+// GET /api/config — Fetch frontend configuration parameters (Google Client ID)
+app.get('/api/config', (req, res) => {
+  res.json({ success: true, googleClientId: GOOGLE_CLIENT_ID });
+});
+
 // POST /api/auth/google — Verify Google Sign-In JWT token
 app.post('/api/auth/google', async (req, res) => {
   try {
