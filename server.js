@@ -1,100 +1,159 @@
 const express = require('express');
-const sqlite3 = require('sqlite3').verbose();
 const cors = require('cors');
 const path = require('path');
 const { OAuth2Client } = require('google-auth-library');
 const crypto = require('crypto');
 
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 
 // Google Client ID (Set this to your Google Developer Console OAuth Client ID)
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || 'YOUR_GOOGLE_CLIENT_ID.apps.googleusercontent.com';
 const googleClient = new OAuth2Client(GOOGLE_CLIENT_ID);
 
-// ── Database setup ──────────────────────────────────────────
-// Support Render persistent disk by pointing to process.env.DATABASE_URL
-const DB_PATH = process.env.DATABASE_URL || path.join(__dirname, 'trades.db');
-const db = new sqlite3.Database(DB_PATH);
+// ── Database setup (Dual-Mode: Postgres or SQLite) ──────────
+const rawDatabaseUrl = process.env.DATABASE_URL;
+const databaseUrl = rawDatabaseUrl ? rawDatabaseUrl.trim().replace(/^["']|["']$/g, '') : null;
+const usePostgres = databaseUrl && (databaseUrl.startsWith('postgres://') || databaseUrl.startsWith('postgresql://'));
 
-// Promisified DB helpers for async/await support
+let dbClient;
+let isPG = false;
+
+if (usePostgres) {
+  const { Pool } = require('pg');
+  dbClient = new Pool({
+    connectionString: databaseUrl,
+    ssl: { rejectUnauthorized: false } // Required for external cloud connection (Render/Neon)
+  });
+  isPG = true;
+  console.log('🐘 Connected to Neon PostgreSQL Database');
+} else {
+  const sqlite3 = require('sqlite3').verbose();
+  const DB_PATH = databaseUrl || path.join(__dirname, 'trades.db');
+  dbClient = new sqlite3.Database(DB_PATH);
+  console.log('💾 Connected to Local SQLite Database');
+}
+
+// Translate SQL query strings from SQLite to PostgreSQL dialect dynamically
+function prepareSQL(sql) {
+  let output = sql;
+  if (isPG) {
+    // Translate syntax
+    output = output.replace(/INTEGER PRIMARY KEY AUTOINCREMENT/gi, 'SERIAL PRIMARY KEY');
+    output = output.replace(/datetime\('now'\)/gi, 'CURRENT_TIMESTAMP');
+    // Translate "?" placeholders to Postgres "$1", "$2", "$3", etc.
+    let index = 1;
+    output = output.replace(/\?/g, () => `$${index++}`);
+  } else {
+    // Translate syntax (reverse fallback)
+    output = output.replace(/SERIAL PRIMARY KEY/gi, 'INTEGER PRIMARY KEY AUTOINCREMENT');
+  }
+  return output;
+}
+
+// Unified Promisified DB helpers
 const dbRun = (sql, params = []) => {
+  const translatedSql = prepareSQL(sql);
   return new Promise((resolve, reject) => {
-    db.run(sql, params, function (err) {
-      if (err) reject(err);
-      else resolve(this);
-    });
+    if (isPG) {
+      dbClient.query(translatedSql, params, (err, res) => {
+        if (err) reject(err);
+        else {
+          // If query has RETURNING id, get the last inserted ID
+          const lastID = res.rows && res.rows[0] ? res.rows[0].id : null;
+          resolve({ lastID, changes: res.rowCount });
+        }
+      });
+    } else {
+      dbClient.run(translatedSql, params, function (err) {
+        if (err) reject(err);
+        else resolve({ lastID: this.lastID, changes: this.changes });
+      });
+    }
   });
 };
 
 const dbAll = (sql, params = []) => {
+  const translatedSql = prepareSQL(sql);
   return new Promise((resolve, reject) => {
-    db.all(sql, params, (err, rows) => {
-      if (err) reject(err);
-      else resolve(rows);
-    });
+    if (isPG) {
+      dbClient.query(translatedSql, params, (err, res) => {
+        if (err) reject(err);
+        else resolve(res.rows);
+      });
+    } else {
+      dbClient.all(translatedSql, params, (err, rows) => {
+        if (err) reject(err);
+        else resolve(rows);
+      });
+    }
   });
 };
 
 const dbGet = (sql, params = []) => {
+  const translatedSql = prepareSQL(sql);
   return new Promise((resolve, reject) => {
-    db.get(sql, params, (err, row) => {
-      if (err) reject(err);
-      else resolve(row);
-    });
+    if (isPG) {
+      dbClient.query(translatedSql, params, (err, res) => {
+        if (err) reject(err);
+        else resolve(res.rows[0] || null);
+      });
+    } else {
+      dbClient.get(translatedSql, params, (err, row) => {
+        if (err) reject(err);
+        else resolve(row);
+      });
+    }
   });
 };
 
-// Initialize DB and Seed Data
-db.serialize(async () => {
-  // Create users table
-  db.run(`
-    CREATE TABLE IF NOT EXISTS users (
-      email   TEXT PRIMARY KEY,
-      name    TEXT,
-      picture TEXT,
-      api_key TEXT UNIQUE NOT NULL,
-      created_at TEXT DEFAULT (datetime('now'))
-    )
-  `);
-
-  // Create trades table
-  db.run(`
-    CREATE TABLE IF NOT EXISTS trades (
-      id         INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_email TEXT    NOT NULL DEFAULT 'admin@tradingjournal.com',
-      type       TEXT    NOT NULL DEFAULT 'backtest',
-      pair       TEXT    NOT NULL DEFAULT 'MNQ',
-      dir        TEXT    NOT NULL,
-      day        TEXT    NOT NULL,
-      date       TEXT    NOT NULL,
-      entry_time TEXT    NOT NULL,
-      exit_time  TEXT    NOT NULL,
-      risk       REAL    NOT NULL DEFAULT 30,
-      poi        TEXT    NOT NULL,
-      result     TEXT    NOT NULL,
-      profit     REAL    NOT NULL DEFAULT 0,
-      sl         REAL    NOT NULL DEFAULT 15,
-      rr         REAL    NOT NULL DEFAULT 0,
-      notes      TEXT    DEFAULT '',
-      created_at TEXT    DEFAULT (datetime('now'))
-    )
-  `);
-
-  // Safely alter existing table to add 'type' column if it was created without it
-  db.run("ALTER TABLE trades ADD COLUMN type TEXT NOT NULL DEFAULT 'backtest'", (err) => {
-    // Ignore error if column already exists
-  });
-
-  // Safely alter existing table to add 'user_email' column if it was created without it
-  db.run("ALTER TABLE trades ADD COLUMN user_email TEXT NOT NULL DEFAULT 'admin@tradingjournal.com'", (err) => {
-    // Ignore error if column already exists
-  });
-
-  // Seed sample data if empty
+// Initialize tables and seed database
+async function initDB() {
   try {
+    // Create users table
+    await dbRun(`
+      CREATE TABLE IF NOT EXISTS users (
+        email   TEXT PRIMARY KEY,
+        name    TEXT,
+        picture TEXT,
+        api_key TEXT UNIQUE NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Create trades table
+    await dbRun(`
+      CREATE TABLE IF NOT EXISTS trades (
+        id         SERIAL PRIMARY KEY,
+        user_email TEXT    NOT NULL DEFAULT 'admin@tradingjournal.com',
+        type       TEXT    NOT NULL DEFAULT 'backtest',
+        pair       TEXT    NOT NULL DEFAULT 'MNQ',
+        dir        TEXT    NOT NULL,
+        day        TEXT    NOT NULL,
+        date       TEXT    NOT NULL,
+        entry_time TEXT    NOT NULL,
+        exit_time  TEXT    NOT NULL,
+        risk       REAL    NOT NULL DEFAULT 30,
+        poi        TEXT    NOT NULL,
+        result     TEXT    NOT NULL,
+        profit     REAL    NOT NULL DEFAULT 0,
+        sl         REAL    NOT NULL DEFAULT 15,
+        rr         REAL    NOT NULL DEFAULT 0,
+        notes      TEXT    DEFAULT '',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // SQLite only alters for backwards compatibility
+    if (!isPG) {
+      dbClient.run("ALTER TABLE trades ADD COLUMN type TEXT NOT NULL DEFAULT 'backtest'", (err) => {});
+      dbClient.run("ALTER TABLE trades ADD COLUMN user_email TEXT NOT NULL DEFAULT 'admin@tradingjournal.com'", (err) => {});
+    }
+
+    // Seed sample data if empty
     const countRow = await dbGet('SELECT COUNT(*) as cnt FROM trades');
-    if (countRow && countRow.cnt === 0) {
+    const count = countRow ? Number(countRow.cnt) : 0;
+    if (count === 0) {
       console.log('🌱 Seeding sample trades into database...');
       const seedTrades = [
         { type: 'backtest', user_email: 'admin@tradingjournal.com', pair:'MNQ', dir:'Long',  day:'Friday',    date:'10/24/2025', entry_time:'10:30AM', exit_time:'10:30AM', risk:30, poi:'15M OB',  result:'Win',  profit:90,   sl:15, rr:3,     notes:'Ran to 4.1R' },
@@ -122,7 +181,9 @@ db.serialize(async () => {
   } catch (err) {
     console.error('❌ Error during database seeding:', err.message);
   }
-});
+}
+
+initDB();
 
 // ── Middleware ──────────────────────────────────────────────
 app.use(cors());
